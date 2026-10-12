@@ -131,6 +131,7 @@ struct PthreadPrivate {
 #ifdef __APPLE__
     // macOS reads another thread's CPU time from its Mach thread, not from a clock id.
     unsigned int hostMachThread = 0;
+    std::atomic<bool> hostNamePending{false};
 #endif
     std::mutex nameLock;
     std::string name;

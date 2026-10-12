@@ -336,7 +336,45 @@ static std::size_t HostStackReserve() {
     }();
     return reserve;
 }
+
+#ifdef __APPLE__
+static constexpr std::size_t HOST_THREAD_NAME_LIMIT = 63;
+#else
+static constexpr std::size_t HOST_THREAD_NAME_LIMIT = 15;
 #endif
+
+static void NameHostThread(PthreadPrivate* thread) {
+    const std::string hostName = thread->name.substr(0, HOST_THREAD_NAME_LIMIT);
+#ifdef __APPLE__
+    thread->hostNamePending.store(false, std::memory_order_relaxed);
+    const int error = pthread_setname_np(hostName.c_str());
+#else
+    const int error = pthread_setname_np(thread->hostThread, hostName.c_str());
+#endif
+    if (error != 0 && !thread->_finished.load(std::memory_order_acquire))
+        throw std::system_error(error, std::generic_category(), "Naming the host thread");
+}
+
+static void ForwardHostName(PthreadPrivate* thread) {
+#ifdef __APPLE__
+    if (thread != CurrentGuestState().current) {
+        thread->hostNamePending.store(true, std::memory_order_release);
+        return;
+    }
+#endif
+    NameHostThread(thread);
+}
+#endif
+
+static void ApplyPendingHostName(PthreadPrivate* self) {
+#ifdef __APPLE__
+    if (!self->hostNamePending.load(std::memory_order_acquire)) return;
+    std::lock_guard lock(self->nameLock);
+    NameHostThread(self);
+#else
+    (void)self;
+#endif
+}
 
 void ThreadLifecycle::SetThreadDtors(thread_dtors_func_t callback) {
     if (!callback)
@@ -380,7 +418,10 @@ static void finishThread(PthreadPrivate* self, void* retval) {
 }
 
 bool ThreadCancel::Requested() {
-    return CurrentGuestState().current && !CurrentGuestState().exiting && CurrentGuestState().cancelState == GUEST_CANCEL_ENABLE && CurrentGuestState().current->cancelPending.load();
+    auto* current = CurrentGuestState().current;
+    if (!current) return false;
+    ApplyPendingHostName(current);
+    return !CurrentGuestState().exiting && CurrentGuestState().cancelState == GUEST_CANCEL_ENABLE && current->cancelPending.load();
 }
 
 void ThreadCancel::Check() {
@@ -407,6 +448,10 @@ static void RunThread(std::unique_ptr<ThreadArgs> args) {
     CurrentGuestState().current = self;
     RegisterStack(self);
 #ifndef _WIN32
+    {
+        std::lock_guard lock(self->nameLock);
+        if (!self->name.empty()) NameHostThread(self);
+    }
     const sigset_t signalMask = args->signalMask;
 #endif
     args.reset();
@@ -717,6 +762,7 @@ Pthread APS5_VABI scePthreadSelf() {
         CurrentGuestState().current = adoptedThread.get();
     }
 #endif
+    ApplyPendingHostName(CurrentGuestState().current);
     return CurrentGuestState().current;
 }
 
@@ -794,6 +840,8 @@ int APS5_VABI scePthreadRename(Pthread thread, const char* name) {
     const std::wstring description(thread->name.begin(), thread->name.end());
     SetThreadDescription(static_cast<HANDLE>(thread->nativeHandle), description.c_str());
     ApplyJobAffinity(*thread, thread->nativeHandle);
+#else
+    ForwardHostName(thread);
 #endif
     return SCE_OK;
 }
